@@ -16,22 +16,37 @@ from tensorflow.test import gpu_device_name
 
 ## create patches from images
 
+def del_dir_contents(path_to_dir):
+    files = glob(os.path.join(path_to_dir,'*'))
+    for f in files:
+        os.remove(f)
+
+def process_mask(mask,kernel = np.ones((5,5), np.uint8)):
+    out + (mask-cv2.erode(mask,kernel))
+    return out
+
 print(gpu_device_name())
 
 image_dir = r'Lightsaver_dataset\images'
 mask_dir = r'Lightsaver_dataset\masks'
 tiles_dir = r'Lightsaver_dataset\image_tiles'
 mask_tiles_dir = r'Lightsaver_dataset\mask_tiles'
+checkpoints_path = r'Unet_checkpoints/checkpoints/'
+training_dump_path = r'training_dumps'
+os.makedirs(checkpoints_path, exist_ok=True)
 
 images = natsorted(glob(os.path.join(image_dir, "*.png")))
 labels = natsorted(glob(os.path.join(mask_dir, "*.png")))
 
+
+# del_dir_contents(tiles_dir)
 # start_no = 0
 # for image in tqdm(images):
 #     # Load the large image
 #     large_image = tf.keras.preprocessing.image.load_img(image)
 #     # Convert the image to a tensor
 #     large_image = tf.keras.preprocessing.image.img_to_array(large_image)
+#     large_image = (large_image/np.max(large_image))*255
 #     # Reshape the tensor to have a batch size of 1
 #     large_image = tf.reshape(large_image, [1, *large_image.shape])
 #     # Extract patches from the large image
@@ -52,15 +67,21 @@ labels = natsorted(glob(os.path.join(mask_dir, "*.png")))
 #         im.save(imname)
 #     start_no = start_no + patches.shape[0]
     
+# del_dir_contents(mask_tiles_dir)
+# kernel = np.ones((5,5), np.uint8)
 # start_no = 0
 # for image in tqdm(labels):
 #     # Load the large image
-#     large_image = tf.keras.preprocessing.image.load_img(image)
-#     # Convert the image to a tensor
-#     large_image = tf.keras.preprocessing.image.img_to_array(large_image)
-#     large_image = large_image[:,:,0,np.newaxis] # only keep one layer and add a new axis
-#     # Reshape the tensor to have a batch size of 1
-#     large_image = tf.reshape(large_image, [1, *large_image.shape])
+#     # large_image = tf.keras.preprocessing.image.load_img(image)
+#     # # Convert the image to a tensor
+#     # large_image = tf.keras.preprocessing.image.img_to_array(large_image)
+#     # large_image = large_image[:,:,0,np.newaxis] # only keep one layer and add a new axis
+
+#     large_image = cv2.imread(image)[:,:,0]/255
+#     large_image = large_image + (large_image-cv2.erode(large_image,kernel))
+#     large_image = tf.keras.utils.to_categorical(large_image)
+#     large_image = large_image[np.newaxis,:]
+    
 #     # Extract patches from the large image
 #     patches = tf.image.extract_patches(
 #         images=large_image,
@@ -70,10 +91,10 @@ labels = natsorted(glob(os.path.join(mask_dir, "*.png")))
 #         padding='VALID'
 #     )
 #     # Reshape the patches tensor to have a batch size of -1
-#     patches = tf.reshape(patches, [-1, 256, 256, 1])
+#     patches = tf.reshape(patches, [-1, 256, 256, 3])
 #     # Write patches to files
 #     for i in range(patches.shape[0]):
-#         im = np.asarray(patches[i,:,:,0]).astype('uint8')
+#         im = np.asarray(patches[i,:,:,:]).astype('uint8')
 #         imname = os.path.join(mask_tiles_dir,'im%03d.png'%(start_no + i))
 #         im = Image.fromarray(im.astype(np.uint8))
 #         im.save(imname)
@@ -93,7 +114,7 @@ idx = np.setdiff1d(np.arange(len(image_files)), train_idx)
 val_idx = np.random.choice(idx, size = int(len(image_files)/4) , replace=False)
 # get test files (25% of total)
 test_idx = np.setdiff1d(val_idx, train_idx)
-
+  
 # create arrays of training, validation, and test files (these are filenames)
 train_images = np.array(image_files)[train_idx]
 val_images = np.array(image_files)[val_idx]
@@ -124,27 +145,69 @@ test_dataset = test_dataset.shuffle(shuffle_buffer_size).batch(batch_size).prefe
 
 model = seg.Unet()
 model.compile(optimizer=Adam(), loss=seg.weighted_crossentropy, metrics=["accuracy"])
-model.summary()
+# model.summary()
 
-history = model.fit(train_dataset, epochs=200, validation_data=val_dataset)
+epochs = 100
 
-plt.figure()
-plt.plot(history.history['loss'])
-plt.plot(history.history['val_loss'])
-plt.xlabel('epoch')
-plt.ylabel('loss')
-plt.xlim([50,200])
-plt.ylim([0.7, 0.72])
+cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoints_path,save_weights_only=True,verbose=1,save_best_only = True)
+es_callback = tf.keras.callbacks.EarlyStopping(monitor = 'val_loss', patience=epochs, restore_best_weights=True)
 
-plt.figure()
-plt.plot(history.history['accuracy'])
-plt.plot(history.history['val_accuracy'])
-plt.xlabel('epoch')
-plt.ylabel('accuracy')
-plt.xlim([100,200])
-plt.ylim([0.95, 0.982])
+class TestAtEpochEnd(tf.keras.callbacks.Callback):
+    def on_train_begin(self, logs=None):
+        # The number of epoch it has waited when loss is no longer minimum.
+        self.wait = 0
+        # The epoch the training stops at.
+        self.stopped_epoch = 0
+        # Initialize the best as infinity.
+        self.best = np.Inf
+    def on_epoch_end(self, epoch, logs=None):
+        current = logs.get("val_loss")
+        os.makedirs(training_dump_path, exist_ok=True)
+        if current < self.best:
+            self.best = current
+            del_dir_contents(training_dump_path)
+            counter = 0
+            for i,element in enumerate(test_dataset.as_numpy_iterator()):
+                test_x,test_y = element
+                prediction = self.model.predict(element[0],verbose = 0)
+                for j in range(prediction.shape[0]):
+                    temp = (cv2.hconcat([test_x[j]/np.max(test_x[j]),test_y[j][:,:,::-1],prediction[j][:,:,::-1]])*255).astype(np.uint8)
+                    cv2.imwrite(os.path.join(training_dump_path,str(counter) + '.jpg'),temp)
+                    counter = counter + 1
+                if i > 9:
+                    break
+
+        else:
+            print('Loss did not improve')
+
+model.load_weights(r'Unet_checkpoints/weights/')
+history = model.fit(train_dataset, epochs=epochs, validation_data=val_dataset,callbacks=[cp_callback,es_callback,TestAtEpochEnd()])
 
 model.evaluate(test_dataset)
-model.save_weights('seg_model')
+model.save_weights('Unet_checkpoints/weights/')
+
+# testing
+model2 = seg.Unet()
+model2.load_weights(r'Unet_checkpoints/weights/')
+
+counter = 0
+for i,element in enumerate(test_dataset.as_numpy_iterator()):
+    test_x,test_y = element
+    prediction = model2.predict(element[0],verbose = 0)
+    for j in range(prediction.shape[0]):
+        temp = (cv2.hconcat([test_x[j]/np.max(test_x[j]),test_y[j][:,:,::-1],prediction[j][:,:,::-1]])*255).astype(np.uint8)
+        cv2.imwrite(os.path.join(training_dump_path,str(counter) + '.jpg'),temp)
+        counter = counter + 1
+
+# image = cv2.imread(val_images[best_test_idx])
+# mask = cv2.imread(val_masks[best_test_idx])
+# # image = tf.image.decode_png(image, channels=3)
+
+# out = model2.predict(image[np.newaxis,:])
+# out = out.squeeze()
+
+# a = np.concatenate([image/255,mask/np.max(mask),out],axis = 1)
+# plt.imshow(a)
+# plt.show()
 
 print('EOF')

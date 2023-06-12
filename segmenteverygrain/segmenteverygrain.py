@@ -360,7 +360,8 @@ def Unet():
     return model
 
 def weighted_crossentropy(y_true, y_pred):
-    class_weights = tf.constant([[[[0.6, 1.0, 5.0]]]]) # increase the weight on the grains and the grain boundaries
+    class_weights = tf.constant([[[[0.6, 1.0, 0.1]]]]) # increase the weight on the grains and the grain boundaries
+    class_weights = tf.constant([[[[0.6, 1.0, 1]]]]) # increase the weight on the grains and the grain boundaries # custom
     unweighted_losses = tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
     weights = tf.reduce_sum(class_weights * y_true, axis=-1)
     weighted_losses = weights * unweighted_losses
@@ -533,9 +534,9 @@ def load_and_preprocess(image_path, mask_path):
     image = tf.image.decode_png(image, channels=3)
     # Load mask and one-hot encode it
     mask = tf.io.read_file(mask_path)
-    mask = tf.image.decode_png(mask, channels=1)
-    mask = tf.cast(mask, tf.int32)
-    mask = tf.one_hot(mask, depth=3, axis=-1)
+    mask = tf.image.decode_png(mask, channels=3)
+    mask = tf.cast(mask, tf.float32)
+    # mask = tf.one_hot(mask, depth=3, axis=-1)
     mask = tf.reshape(mask, (256, 256, 3))
     # Normalize images
     image = tf.cast(image, tf.float32) / 255.0
