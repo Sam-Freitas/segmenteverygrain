@@ -6,7 +6,6 @@ from tqdm import tqdm, trange
 from glob import glob 
 import segmenteverygrain as seg
 import os
-from tensorflow.keras.optimizers import Adam
 import matplotlib.pyplot as plt
 from importlib import reload
 from natsort import natsorted
@@ -104,17 +103,21 @@ image_files = natsorted(glob(os.path.join(tiles_dir, "*.png")))
 mask_files = natsorted(glob(os.path.join(mask_tiles_dir, "*.png")))
 
 batch_size = 128
-shuffle_buffer_size = 1000
+shuffle_buffer_size = 1000   
 
-# split half into training
-train_idx = np.random.choice(np.arange(len(image_files)), size = int(len(image_files)/2) , replace=False)
-# get the rest
-idx = np.setdiff1d(np.arange(len(image_files)), train_idx)
-# get val files (25% of total)
-val_idx = np.random.choice(idx, size = int(len(image_files)/4) , replace=False)
-# get test files (25% of total)
-test_idx = np.setdiff1d(val_idx, train_idx)
-  
+train_idx = np.arange(len(image_files))[0:int(len(image_files)/2)] # first 50%
+val_idx = np.arange(len(image_files))[int(len(image_files)/2):(int(len(image_files)/2)+int(len(image_files)/4))] # next 25%
+test_idx = np.arange(len(image_files))[(int(len(image_files)/2)+int(len(image_files)/4)):] # remaining 25%
+
+# # split half into training
+# train_idx = np.random.choice(np.arange(len(image_files)), size = int(len(image_files)/2) , replace=False)
+# # get the rest
+# idx = np.setdiff1d(np.arange(len(image_files)), train_idx)
+# # get val files (25% of total)
+# val_idx = np.random.choice(idx, size = int(len(image_files)/4) , replace=False)
+# # get test files (25% of total)
+# test_idx = np.setdiff1d(val_idx, train_idx)
+
 # create arrays of training, validation, and test files (these are filenames)
 train_images = np.array(image_files)[train_idx]
 val_images = np.array(image_files)[val_idx]
@@ -136,34 +139,39 @@ test_dataset = tf.data.Dataset.from_tensor_slices((test_images, test_masks))
 test_dataset = test_dataset.map(seg.load_and_preprocess, num_parallel_calls=tf.data.AUTOTUNE)
 test_dataset = test_dataset.shuffle(shuffle_buffer_size).batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
-# example_img = train_images[32]
-# example_mask = train_masks[32]
-# img = cv2.imread(example_img)
-# img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) # need to convert from BGR to RGB
-# mask = cv2.imread(example_mask)
-# seg.plot_images_and_labels(img, mask)
-
 model = seg.Unet()
-model.compile(optimizer=Adam(), loss=seg.weighted_crossentropy, metrics=["accuracy"])
+optimizer = tf.keras.optimizers.Adam(learning_rate=0.005)
+model.compile(optimizer=optimizer, loss=seg.weighted_crossentropy, metrics=["accuracy"])
 # model.summary()
 
-epochs = 100
+epochs = 1000
 
 cp_callback = tf.keras.callbacks.ModelCheckpoint(filepath=checkpoints_path,save_weights_only=True,verbose=1,save_best_only = True)
 es_callback = tf.keras.callbacks.EarlyStopping(monitor = 'val_loss', patience=epochs, restore_best_weights=True)
 
 class TestAtEpochEnd(tf.keras.callbacks.Callback):
     def on_train_begin(self, logs=None):
-        # The number of epoch it has waited when loss is no longer minimum.
-        self.wait = 0
-        # The epoch the training stops at.
-        self.stopped_epoch = 0
         # Initialize the best as infinity.
         self.best = np.Inf
     def on_epoch_end(self, epoch, logs=None):
+        if epoch == 0:
+            field_names = list(logs.keys())
+            try:
+                os.remove('training_results.txt')
+            except:
+                pass
+            with open('training_results.txt', 'a') as fd:
+                fd.write(str(field_names) + '\n')
+                fd.write(str(np.round(np.asarray(list(logs.values())),6)) + '\n')
+        else:
+            with open('training_results.txt', 'a') as fd:
+                fd.write(str(np.round(np.asarray(list(logs.values())),6)) + '\n')
+        
         current = logs.get("val_loss")
         os.makedirs(training_dump_path, exist_ok=True)
         if current < self.best:
+            eval_results = model.evaluate(test_dataset)
+            print('EVAL LOSS:', round(eval_results[0],4), 'EVAL ACC:', round(eval_results[1],4))
             self.best = current
             del_dir_contents(training_dump_path)
             counter = 0
@@ -174,13 +182,12 @@ class TestAtEpochEnd(tf.keras.callbacks.Callback):
                     temp = (cv2.hconcat([test_x[j]/np.max(test_x[j]),test_y[j][:,:,::-1],prediction[j][:,:,::-1]])*255).astype(np.uint8)
                     cv2.imwrite(os.path.join(training_dump_path,str(counter) + '.jpg'),temp)
                     counter = counter + 1
-                if i > 9:
+                if i > 2:
                     break
-
         else:
             print('Loss did not improve')
 
-model.load_weights(r'Unet_checkpoints/weights/')
+# model.load_weights(r'Unet_checkpoints/checkpoints/')
 history = model.fit(train_dataset, epochs=epochs, validation_data=val_dataset,callbacks=[cp_callback,es_callback,TestAtEpochEnd()])
 
 model.evaluate(test_dataset)

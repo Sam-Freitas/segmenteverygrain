@@ -42,13 +42,57 @@ from tensorflow.keras.preprocessing.image import load_img
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
 def predict_image_tile(im_tile,model):
+    if len(np.shape(im_tile))<=3:
+        im_tile = im_tile[np.newaxis,:]
+    prediction = model.predict(im_tile, verbose=0).squeeze()
+    return prediction
+
+def predict_image_tile_old(im_tile,model):
     if len(np.shape(im_tile)) == 2:
         im_tile = np.expand_dims(im_tile, 2)
     im_tile = model.predict(np.stack((im_tile, im_tile), axis=0), verbose=0)
     im_tile_pred = im_tile[0] 
     return im_tile_pred
 
-def predict_big_image(big_im, model, I):
+def patches_to_image(patches,axes_1_2_size,k_size,img_size):
+
+    reconstruct = tf.reshape(patches, (1, axes_1_2_size, axes_1_2_size, k_size, k_size, 3)) 
+    # Tranpose the axes (I got this axes tuple for transpose via experimentation)
+    reconstruct = tf.transpose(reconstruct, (0, 1, 3, 2, 4, 5))
+    # Reshape back
+    reconstruct = tf.reshape(reconstruct, (img_size, img_size, 3))
+
+    return reconstruct
+
+def predict_big_image(big_im, model, patch_size, stride_size = None):
+
+    if stride_size == None:
+        stride_size = patch_size
+
+    big_im = big_im[np.newaxis,:]
+    img_size = big_im.shape[1]
+    
+    # Extract patches from the large image
+    patches = tf.image.extract_patches(
+        images=big_im,
+        sizes=[1, patch_size, patch_size, 1],
+        strides=[1, stride_size, stride_size, 1],
+        rates=[1, 1, 1, 1],
+        padding='SAME'
+    )
+
+    patches = tf.reshape(patches, [-1, patch_size, patch_size, 3])
+
+    prediction_on_patches = model.predict(patches,verbose = 0)
+
+    axes_1_2_size = int(np.sqrt((img_size * img_size) / (patch_size * patch_size)))
+
+    big_im_pred = patches_to_image(prediction_on_patches,axes_1_2_size,patch_size,img_size)
+    
+    return big_im_pred
+
+
+def predict_big_image_old(big_im, model, I):
     pad_rows = I - np.mod(big_im.shape[0], I)
     pad_cols = I - np.mod(big_im.shape[1], I)
     if len(np.shape(big_im)) == 2:
@@ -528,6 +572,12 @@ def sam_segmentation(sam, big_im, big_im_pred, coords, labels, min_area):
     grain_data = pd.DataFrame(props)
     return all_grains, labels, mask_all, grain_data, fig, ax
 
+def load_image(image_path): # new
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_png(image, channels=3)
+    image = tf.cast(image, tf.float32)
+    return image
+
 def load_and_preprocess(image_path, mask_path):
     # Load images
     image = tf.io.read_file(image_path)
@@ -549,11 +599,11 @@ def load_and_preprocess(image_path, mask_path):
     mask = tf.image.stateless_random_flip_left_right(mask, seed=seed)
     mask = tf.image.stateless_random_flip_up_down(mask, seed=seed)
     # this doesn't work for some reason (validation loss is too high)
-    # if np.random.random() > 0.5: # only do this half the time 
-    #     image = tf.image.stateless_random_crop(image, (128, 128, 3), seed=seed)
-    #     image = tf.image.resize(image, (256, 256))
-    #     mask = tf.image.stateless_random_crop(mask, (128, 128, 3), seed=seed)
-    #     mask = tf.image.resize(mask, (256, 256), method='nearest')
+    if np.random.random() > 0.75: # only do this half the time 
+        image = tf.image.stateless_random_crop(image, (128, 128, 3), seed=seed)
+        image = tf.image.resize(image, (256, 256))
+        mask = tf.image.stateless_random_crop(mask, (128, 128, 3), seed=seed)
+        mask = tf.image.resize(mask, (256, 256), method='nearest')
     return image, mask
 
 def onclick(event, ax, coords, image, predictor):
