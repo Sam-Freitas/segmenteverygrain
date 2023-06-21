@@ -12,6 +12,8 @@ import cv2
 import networkx as nx
 import rasterio
 from rasterio.features import rasterize
+from glob import glob
+import os
 
 from skimage import measure, morphology
 from skimage.measure import regionprops, regionprops_table
@@ -38,8 +40,54 @@ from tensorflow.keras.layers import concatenate, add
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.preprocessing.image import load_img
+import tensorflow.keras.layers as L
+
+import tensorflow_io as tfio
 
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+# tf.keras.mixed_precision.set_global_policy('mixed_float16')
+
+def channelSplit(image):
+    return np.dsplit(image,image.shape[-1])
+
+def preprocess_fluor_image(img_array,remove_scale_bar = False):
+
+    rgb_list = channelSplit(img_array)
+    color_choice = np.argmax(list(map(np.sum, rgb_list)))
+
+    if color_choice == 0:
+        data = rgb_list[0] - rgb_list[1] - rgb_list[2]
+    if color_choice == 1:
+        data = rgb_list[1] - rgb_list[0] - rgb_list[2]
+    if color_choice == 2:
+        data = rgb_list[2] - rgb_list[0] - rgb_list[1]
+    data[-50:,0:250,:] = np.median(data)
+
+    data = np.interp(data, (data.min(), data.max()), (0, 255)).squeeze()
+
+    return data
+
+def dump_to_pngs(images,preprocess_fluor_img = False,remove_scale_bar = False):
+    time.sleep(0.1)
+    path_to_new_image = os.path.join(os.getcwd(),'images_as_png')
+    os.makedirs(path_to_new_image, exist_ok=True)
+
+    files = glob(os.path.join(path_to_new_image,'*'))
+    for f in files:
+        os.remove(f)
+
+    new_images = []
+    for i, img in enumerate(tqdm(images)):
+        img_path, img_name = os.path.split(img)
+        new_img_name = img_name[:-3] + 'png'
+        new_img_path = os.path.join(path_to_new_image,new_img_name)
+        img_array = cv2.imread(img)
+        if preprocess_fluor_img:
+            img_array = preprocess_fluor_image(img_array, remove_scale_bar = remove_scale_bar)
+        cv2.imwrite(new_img_path,img_array)
+        new_images.append(new_img_path)
+    
+    return new_images
 
 def predict_image_tile(im_tile,model):
     if len(np.shape(im_tile))<=3:
@@ -345,10 +393,10 @@ def find_overlapping_polygons(polygons, min_overlap_area):
                 overlap_areas.append(poly1.intersection(poly2).area)
     return overlapping_polygons, overlap_areas #, polys_to_be_removed
 
-def Unet():
+def Unet(input_shape = (256,256,3)):
     tf.keras.backend.clear_session()
 
-    image = tf.keras.Input((256, 256, 3), name='input')
+    image = tf.keras.Input(input_shape, name='input')
     
     conv1 = Conv2D(16, (3,3), activation='relu', padding = 'same')(image)
     conv1 = Conv2D(16, (3,3), activation='relu', padding = 'same')(conv1)
@@ -398,14 +446,14 @@ def Unet():
     conv9 = Conv2D(16, (3,3), activation='relu', padding = 'same')(conv9)
     conv9 = BatchNormalization()(conv9)
 
-    conv10 = Conv2D(3, (1,1), activation='softmax')(conv9)
+    conv10 = Conv2D(3, (1,1), activation='sigmoid')(conv9) # softmax sigmoid
     model = Model(inputs=[image], outputs=[conv10])
 
     return model
 
 def weighted_crossentropy(y_true, y_pred):
-    class_weights = tf.constant([[[[0.6, 1.0, 0.1]]]]) # increase the weight on the grains and the grain boundaries
-    class_weights = tf.constant([[[[0.6, 1.0, 1]]]]) # increase the weight on the grains and the grain boundaries # custom
+    # class_weights = tf.constant([[[[0.6, 1.0, 0.1]]]]) # increase the weight on the grains and the grain boundaries
+    class_weights = tf.constant([[[[0.6, 1.0, 0.6]]]]) # increase the weight on the grains and the grain boundaries # custom
     unweighted_losses = tf.nn.softmax_cross_entropy_with_logits(labels=y_true, logits=y_pred)
     weights = tf.reduce_sum(class_weights * y_true, axis=-1)
     weighted_losses = weights * unweighted_losses
@@ -573,10 +621,46 @@ def sam_segmentation(sam, big_im, big_im_pred, coords, labels, min_area):
     return all_grains, labels, mask_all, grain_data, fig, ax
 
 def load_image(image_path): # new
+
     image = tf.io.read_file(image_path)
     image = tf.image.decode_png(image, channels=3)
     image = tf.cast(image, tf.float32)
+    image = tf.image.per_image_standardization(image)
+    # image = tf.image.sobel_edges(tf.expand_dims(image, 0))
+    # image = tf.squeeze(image)
+    # image = tf.math.add(image[:,:,:,0],image[:,:,:,1])
     return image
+
+def load_image_tif(image_path):
+
+    image = tf.io.read_file(image_path)
+    image = tfio.experimental.image.decode_tiff(image)
+    image = tf.cast(image, tf.float32)
+    image = tf.image.per_image_standardization(image)
+    # image = tf.image.sobel_edges(tf.expand_dims(image, 0))
+    # image = tf.squeeze(image)
+    # image = tf.math.add(image[:,:,:,0],image[:,:,:,1])
+    # image = tf.image.per_image_standardization(image)
+    return image
+
+def load_image_and_mask_nopreprocess(image_path, mask_path):
+    image = tf.io.read_file(image_path)
+    image = tf.image.decode_png(image, channels=3)
+    # Load mask and one-hot encode it
+    mask = tf.io.read_file(mask_path)
+    mask = tf.image.decode_png(mask, channels=3)
+    mask = tf.cast(mask, tf.float32)
+    # mask = tf.one_hot(mask, depth=3, axis=-1)
+    # mask = tf.reshape(mask, (256,256, 3))
+    mask = tf.reshape(mask, (256, 256, 3))
+    # Normalize images
+    image = tf.cast(image, tf.float32) 
+    image = tf.image.per_image_standardization(image)
+    # image = tf.image.sobel_edges(tf.expand_dims(image, 0))
+    # image = tf.squeeze(image)
+    # image = tf.math.add(image[:,:,:,0],image[:,:,:,1])
+    # image = tf.image.per_image_standardization(image)
+    return image,mask
 
 def load_and_preprocess(image_path, mask_path):
     # Load images
@@ -587,23 +671,34 @@ def load_and_preprocess(image_path, mask_path):
     mask = tf.image.decode_png(mask, channels=3)
     mask = tf.cast(mask, tf.float32)
     # mask = tf.one_hot(mask, depth=3, axis=-1)
+    # mask = tf.reshape(mask, (256, 256, 3))
     mask = tf.reshape(mask, (256, 256, 3))
     # Normalize images
-    image = tf.cast(image, tf.float32) / 255.0
+    image = tf.cast(image, tf.float32) 
+    image = tf.image.per_image_standardization(image)
+    # image = tf.image.sobel_edges(tf.expand_dims(image, 0))
+    # image = tf.squeeze(image)
+    # image = tf.math.add(image[:,:,:,0],image[:,:,:,1])
+    # image = tf.image.per_image_standardization(image)
     # Apply augmentations
     seed = tf.random.experimental.stateless_split(tf.zeros([2], dtype=tf.int32), num=2)[0]
-    image = tf.image.stateless_random_brightness(image, max_delta=0.1, seed=seed)
-    image = tf.image.stateless_random_contrast(image, lower=0.9, upper=1.1, seed=seed)
+    image = tf.image.stateless_random_brightness(image, max_delta=0.5, seed=seed)
+    image = tf.image.stateless_random_contrast(image, lower=0.1, upper=1.1, seed=seed)
     image = tf.image.stateless_random_flip_left_right(image, seed=seed)
     image = tf.image.stateless_random_flip_up_down(image, seed=seed)
     mask = tf.image.stateless_random_flip_left_right(mask, seed=seed)
     mask = tf.image.stateless_random_flip_up_down(mask, seed=seed)
     # this doesn't work for some reason (validation loss is too high)
-    if np.random.random() > 0.75: # only do this half the time 
-        image = tf.image.stateless_random_crop(image, (128, 128, 3), seed=seed)
-        image = tf.image.resize(image, (256, 256))
-        mask = tf.image.stateless_random_crop(mask, (128, 128, 3), seed=seed)
-        mask = tf.image.resize(mask, (256, 256), method='nearest')
+    # if np.random.random() > 0.25: # only do this half the time 
+    #     image = tf.image.stateless_random_crop(image, (128, 128, 3), seed=seed)
+    #     image = tf.image.resize(image, (256, 256))
+    #     mask = tf.image.stateless_random_crop(mask, (128, 128, 3), seed=seed)
+    #     mask = tf.image.resize(mask, (256, 256), method='nearest')
+    # if np.random.random() > 0.75: # only do this half the time 
+    #     image = tf.image.stateless_random_crop(image, (350, 350, 3), seed=seed)
+    #     image = tf.image.resize_with_pad(image, 512, 512)
+    #     mask = tf.image.stateless_random_crop(mask, (350, 350, 3), seed=seed)
+    #     mask = tf.image.resize_with_pad(mask, 512, 512, method='nearest')
     return image, mask
 
 def onclick(event, ax, coords, image, predictor):
@@ -767,3 +862,73 @@ def plot_grain_axes_and_centroids(all_grains, labels, ax, linewidth=1, markersiz
         ax.plot((x0, x1), (y0, y1), '-k', linewidth=linewidth)
         ax.plot((x0, x2), (y0, y2), '-k', linewidth=linewidth)
         ax.plot(x0, y0, '.k', markersize=markersize)
+
+smooth = 1.
+
+def dice_coef(y_true, y_pred):
+    y_true_f = tf.layers.flatten(y_true)
+    y_pred_f = tf.layers.flatten(y_pred)
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+
+def dice_coef_loss(y_true, y_pred):
+    return 1.0 - dice_coef(y_true, y_pred)
+
+def conv_block(x, num_filters):
+    x = L.Conv2D(num_filters, 3, padding="same")(x)
+    x = L.BatchNormalization()(x)
+    x = L.Activation("relu")(x)
+ 
+    x = L.Conv2D(num_filters, 3, padding="same")(x)
+    x = L.BatchNormalization()(x)
+    x = L.Activation("relu")(x)
+ 
+    return x
+
+def encoder_block(x, num_filters):
+    x = conv_block(x, num_filters)
+    p = L.MaxPool2D((2, 2))(x)
+    return x, p
+
+def attention_gate(g, s, num_filters):
+    Wg = L.Conv2D(num_filters, 1, padding="same")(g)
+    Wg = L.BatchNormalization()(Wg)
+ 
+    Ws = L.Conv2D(num_filters, 1, padding="same")(s)
+    Ws = L.BatchNormalization()(Ws)
+ 
+    out = L.Activation("relu")(Wg + Ws)
+    out = L.Conv2D(num_filters, 1, padding="same")(out)
+    out = L.Activation("sigmoid")(out)
+ 
+    return out * s
+
+def decoder_block(x, s, num_filters):
+    x = L.UpSampling2D(interpolation="bilinear")(x)
+    s = attention_gate(x, s, num_filters)
+    x = L.Concatenate()([x, s])
+    x = conv_block(x, num_filters)
+    return x
+
+def attention_unet(input_shape):
+    """ Inputs """
+    inputs = L.Input(input_shape)
+ 
+    """ Encoder """
+    s1, p1 = encoder_block(inputs, 64)
+    s2, p2 = encoder_block(p1, 128)
+    s3, p3 = encoder_block(p2, 256)
+ 
+    b1 = conv_block(p3, 512)
+ 
+    """ Decoder """
+    d1 = decoder_block(b1, s3, 256)
+    d2 = decoder_block(d1, s2, 128)
+    d3 = decoder_block(d2, s1, 64)
+ 
+    """ Outputs """
+    outputs = L.Conv2D(3, 1, padding="same", activation="sigmoid")(d3)
+ 
+    """ Model """
+    model = Model(inputs, outputs, name="Attention-UNET")
+    return model 
